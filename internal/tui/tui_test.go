@@ -225,7 +225,7 @@ func TestCSVExport(t *testing.T) {
 	}
 
 	content := string(data)
-	if !strings.Contains(content, "GroupIndex,Hash,FileSizeBytes,FilePath,IsKeeper,SelectedForCleanup,ModTime") {
+	if !strings.Contains(content, "group_id,path,size,hash,keeper,selection,savings") {
 		t.Errorf("missing CSV header in: %s", content)
 	}
 	if !strings.Contains(content, "true") { // At least one keeper is marked true
@@ -379,5 +379,36 @@ func TestTextInputHandling(t *testing.T) {
 	ti.HandleKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'X'}})
 	if ti.Value != "/tmp/tesXt" {
 		t.Errorf("expected /tmp/tesXt, got %s", ti.Value)
+	}
+}
+
+func TestRecoveryInconsistenciesProduceWarnings(t *testing.T) {
+	dir, _ := createTestFiles(t)
+
+	// Inject an untracked file inside quarantine files directory
+	qFilesDir := filepath.Join(dir, ".duplicate-detective", "quarantine", "files", "untracked-op")
+	if err := os.MkdirAll(qFilesDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(qFilesDir, "orphan.txt"), []byte("orphan"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	m := setupTestModel(t, dir)
+
+	// Open recovery view
+	m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'r'}})
+	if m.State != ViewStateRecovery {
+		t.Fatalf("expected ViewStateRecovery, got %v", m.State)
+	}
+
+	// Warnings should be populated
+	if len(m.ReconciliationWarnings) == 0 {
+		t.Fatalf("expected reconciliation warnings for untracked file, got 0")
+	}
+
+	view := m.View()
+	if !strings.Contains(view, "RECOVERY WARNINGS") {
+		t.Errorf("expected recovery view to display warnings header, got:\n%s", view)
 	}
 }

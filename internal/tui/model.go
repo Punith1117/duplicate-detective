@@ -9,6 +9,7 @@ import (
 	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
+	"duplicate-detective/internal/planner"
 	"duplicate-detective/internal/scanner"
 )
 
@@ -118,10 +119,12 @@ func (ti *TextInput) HandleKey(msg tea.KeyMsg) bool {
 // Model represents the overall TUI application state.
 type Model struct {
 	// Configuration & Services
-	Scanner           *scanner.Scanner
-	Planner           KeeperPlanner
-	QuarantineManager QuarantineManager
-	Exporter          CSVExporter
+	Scanner                *scanner.Scanner
+	Planner                KeeperPlanner
+	QuarantineManager      QuarantineManager
+	Exporter               CSVExporter
+	Plan                   *planner.Plan
+	ReconciliationWarnings []string
 
 	// View & Window
 	State      ViewState
@@ -181,9 +184,9 @@ func NewModel(initialPath string) Model {
 
 	m := Model{
 		Scanner:           scanner.New(),
-		Planner:           NewDefaultKeeperPlanner(),
-		QuarantineManager: NewDefaultQuarantineManager(),
-		Exporter:          NewDefaultCSVExporter(),
+		Planner:           NewPlannerAdapter(initialPath),
+		QuarantineManager: NewQuarantineAdapter(),
+		Exporter:          NewReportCSVExporter(),
 		State:             ViewStateInput,
 		ActivePane:        PaneGroups,
 		PathInput:         NewTextInput(initialPath, "Enter directory path to scan..."),
@@ -292,15 +295,34 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.GroupScroll = 0
 		m.FileScroll = 0
 
-		// Identify keepers for all duplicate groups using Planner
-		for _, group := range m.ScanResult.Duplicates {
-			keeper := m.Planner.RecommendKeeper(group)
-			m.Keepers[group.Hash] = keeper
+		// Identify keepers and generate plan using internal/planner
+		plan, err := planner.PlanDuplicates(m.ScanResult.Duplicates, planner.Options{
+			BaseDir:  m.ScanPath,
+			Strategy: planner.StrategyOldest,
+		})
+		if err == nil {
+			m.Plan = plan
+			for _, group := range plan.Groups {
+				m.Keepers[group.Hash] = group.RecommendedKeeper
+			}
+		} else {
+			for _, group := range m.ScanResult.Duplicates {
+				keeper := m.Planner.RecommendKeeper(group)
+				m.Keepers[group.Hash] = keeper
+			}
+		}
+
+		// Retrieve any quarantine startup reconciliation warnings
+		if warnings, err := m.QuarantineManager.GetReconciliationWarnings(m.ScanPath); err == nil && len(warnings) > 0 {
+			m.ReconciliationWarnings = warnings
 		}
 
 		status := fmt.Sprintf("Found %d duplicate groups (%s potential savings).",
 			len(m.ScanResult.Duplicates),
 			FormatBytes(m.ScanResult.TotalWastedSpace()))
+		if len(m.ReconciliationWarnings) > 0 {
+			status += fmt.Sprintf(" (Notice: %d quarantine recovery warnings)", len(m.ReconciliationWarnings))
+		}
 		cmds = append(cmds, m.triggerStatus(status, false))
 
 	case quarantineCompletedMsg:
@@ -341,6 +363,13 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if m.SelectedGroupIdx < 0 {
 				m.SelectedGroupIdx = 0
 			}
+		}
+
+		if m.ScanResult != nil {
+			m.Plan, _ = planner.PlanDuplicates(m.ScanResult.Duplicates, planner.Options{
+				BaseDir:  m.ScanPath,
+				Strategy: planner.StrategyOldest,
+			})
 		}
 
 		status := fmt.Sprintf("Quarantined %d files (%s reclaimed).", msg.Count, FormatBytes(msg.Bytes))
@@ -405,6 +434,18 @@ func (m *Model) currentFile() *scanner.FileInfo {
 
 // CalculateSelectedSavings returns total count and bytes of selected files.
 func (m *Model) CalculateSelectedSavings() (int, int64) {
+	if m.Plan != nil {
+		count := 0
+		for _, g := range m.Plan.Groups {
+			for _, f := range g.Files {
+				if f.Selected {
+					count++
+				}
+			}
+		}
+		return count, m.Plan.SelectedSavings
+	}
+
 	count := 0
 	var bytes int64
 	if m.ScanResult == nil {
@@ -629,7 +670,14 @@ func (m *Model) toggleCurrentFileSelection() (tea.Model, tea.Cmd) {
 		return m, m.triggerStatus("Protected: Keeper file cannot be selected for deletion.", true)
 	}
 
-	m.SelectedFiles[file.Path] = !m.SelectedFiles[file.Path]
+	target := !m.SelectedFiles[file.Path]
+	if m.Plan != nil {
+		if err := m.Plan.SetSelection(file.Path, target); err != nil {
+			return m, m.triggerStatus("Safety protection: "+err.Error(), true)
+		}
+	}
+
+	m.SelectedFiles[file.Path] = target
 	if !m.SelectedFiles[file.Path] {
 		delete(m.SelectedFiles, file.Path)
 	}
@@ -662,6 +710,9 @@ func (m *Model) toggleCurrentGroupSelection() (tea.Model, tea.Cmd) {
 		if f.Path == keeper {
 			continue
 		}
+		if m.Plan != nil {
+			_ = m.Plan.SetSelection(f.Path, target)
+		}
 		if target {
 			m.SelectedFiles[f.Path] = true
 		} else {
@@ -676,6 +727,15 @@ func (m *Model) toggleCurrentGroupSelection() (tea.Model, tea.Cmd) {
 func (m *Model) selectAllEligible() (tea.Model, tea.Cmd) {
 	if m.ScanResult == nil || len(m.ScanResult.Duplicates) == 0 {
 		return m, nil
+	}
+
+	if m.Plan != nil {
+		m.Plan.SelectNonKeepers()
+		m.SelectedFiles = make(map[string]bool)
+		for _, f := range m.Plan.SelectedFiles() {
+			m.SelectedFiles[f.Path] = true
+		}
+		return m, m.triggerStatus(fmt.Sprintf("Selected %d eligible duplicates (keepers protected).", len(m.SelectedFiles)), false)
 	}
 
 	selectedCount := 0
@@ -767,6 +827,14 @@ func (m *Model) exportCSV() (tea.Model, tea.Cmd) {
 	defaultName := fmt.Sprintf("duplicate-detective-report-%s.csv", time.Now().Format("20060102-150405"))
 	outPath := filepath.Join(".", defaultName)
 
+	if m.Plan != nil {
+		plan := m.Plan
+		return m, func() tea.Msg {
+			err := m.Exporter.ExportPlan(outPath, plan)
+			return csvExportedMsg{Path: outPath, Err: err}
+		}
+	}
+
 	res := m.ScanResult
 	keepers := m.Keepers
 	selected := m.SelectedFiles
@@ -778,6 +846,10 @@ func (m *Model) exportCSV() (tea.Model, tea.Cmd) {
 }
 
 func (m *Model) openRecovery() (tea.Model, tea.Cmd) {
+	if warnings, err := m.QuarantineManager.GetReconciliationWarnings(m.ScanPath); err == nil && len(warnings) > 0 {
+		m.ReconciliationWarnings = warnings
+	}
+
 	records, err := m.QuarantineManager.ListRecords(m.ScanPath)
 	if err != nil {
 		return m, m.triggerStatus("Failed to load recovery history: "+err.Error(), true)

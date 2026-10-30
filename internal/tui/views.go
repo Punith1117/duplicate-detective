@@ -410,13 +410,28 @@ func (m *Model) renderFilesPane(width, height int) string {
 		fullPathLabel := lipgloss.NewStyle().Foreground(ColorCyanBright).Render("Path: ") +
 			lipgloss.NewStyle().Foreground(ColorTextPrimary).Render(currFile.Path)
 
+		var reasonLabel string
+		if isKeeper {
+			reason := m.Planner.ExplainRecommendation(*group)
+			if reason != "" {
+				reasonLabel = lipgloss.NewStyle().Foreground(ColorTextMuted).Italic(true).Render("Recommendation: " + reason)
+			}
+		} else {
+			reasonLabel = lipgloss.NewStyle().Foreground(ColorTextDim).Italic(true).Render("Recommendation: Duplicate copy of keeper " + TruncatePath(keeperPath, 45))
+		}
+
+		detailContent := []string{detailStatus, fullPathLabel}
+		if reasonLabel != "" {
+			detailContent = append(detailContent, reasonLabel)
+		}
+
 		detailBox := lipgloss.NewStyle().
 			Border(lipgloss.NormalBorder()).
 			BorderForeground(ColorBorder).
 			Background(ColorCardBg).
 			Padding(0, 1).
 			Width(width - 4).
-			Render(lipgloss.JoinVertical(lipgloss.Left, detailStatus, fullPathLabel))
+			Render(lipgloss.JoinVertical(lipgloss.Left, detailContent...))
 
 		rows = append(rows, "", detailBox)
 	}
@@ -487,6 +502,24 @@ func (m *Model) viewRecovery() string {
 		"Review quarantined files and restore them to their original filesystem locations.",
 	)
 
+	var warnBox string
+	if len(m.ReconciliationWarnings) > 0 {
+		var warnItems []string
+		warnItems = append(warnItems, lipgloss.NewStyle().Foreground(ColorWarning).Bold(true).Render(
+			fmt.Sprintf("⚠ RECOVERY WARNINGS / INCONSISTENCIES (%d):", len(m.ReconciliationWarnings)),
+		))
+		for _, w := range m.ReconciliationWarnings {
+			warnItems = append(warnItems, lipgloss.NewStyle().Foreground(ColorWarning).Render("  • "+w))
+		}
+		warnBox = lipgloss.NewStyle().
+			Border(lipgloss.NormalBorder()).
+			BorderForeground(ColorWarning).
+			Background(ColorCardBg).
+			Padding(0, 1).
+			MarginBottom(1).
+			Render(lipgloss.JoinVertical(lipgloss.Left, warnItems...))
+	}
+
 	records := m.RecoveryRecords
 	var body string
 
@@ -555,16 +588,16 @@ func (m *Model) viewRecovery() string {
 		KeyBadgeStyle.Render("Esc"), KeyDescStyle.Render(" Return to dashboard"),
 	)
 
+	var contentItems []string
+	contentItems = append(contentItems, title, sub, "")
+	if warnBox != "" {
+		contentItems = append(contentItems, warnBox)
+	}
+	contentItems = append(contentItems, body, "", statusLine, "", help)
+
 	content := lipgloss.JoinVertical(
 		lipgloss.Left,
-		title,
-		sub,
-		"",
-		body,
-		"",
-		statusLine,
-		"",
-		help,
+		contentItems...,
 	)
 
 	box := ModalOverlayStyle.Width(m.Width - 8).Render(content)
